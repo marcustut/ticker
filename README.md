@@ -23,7 +23,7 @@ Requires Rust 1.85+ (edition 2024).
 ## Usage
 
 ```sh
-ticker --config-file path/to/config.toml
+ticker --config-file path/to/ticker.toml
 ```
 
 ### Options
@@ -37,7 +37,7 @@ ticker --config-file path/to/config.toml
 Logs are written to stdout and to `./logs/ticker.log.<date>` (rolling daily). Override the log level with the `RUST_LOG` environment variable:
 
 ```sh
-RUST_LOG=debug ticker -c config.toml
+RUST_LOG=debug ticker -c ticker.toml
 ```
 
 ## Configuration
