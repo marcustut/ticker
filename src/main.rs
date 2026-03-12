@@ -19,13 +19,21 @@ struct ThreadPoolState {
 
 #[derive(Debug, Clone, Parser)]
 struct Args {
+    /// Configuration file (eg. ticker.toml)
     #[clap(short, long)]
     config_file: PathBuf,
+    /// Directory for running logs file
+    #[clap(short, long, default_value = "./logs")]
+    logs_dir: PathBuf,
 }
 
-fn main() -> color_eyre::Result<()> {
+#[tokio::main]
+async fn main() -> color_eyre::Result<()> {
+    // Parse CLI args
+    let args = Args::parse();
+
     // Setup logging to console and file
-    let file_appender = tracing_appender::rolling::daily("./logs", "ticker.log");
+    let file_appender = tracing_appender::rolling::daily(args.logs_dir, "ticker.log");
     let (non_blocking_writer, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::registry()
         .with(
@@ -41,47 +49,43 @@ fn main() -> color_eyre::Result<()> {
         .with(EnvFilter::try_from_default_env().unwrap_or("info".into()))
         .init();
 
-    let args = Args::parse();
+    // Setup a local file watcher
+    let watcher = sentinel::file::FileWatcher::new(args.config_file)?;
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    // Setup the threadpool
+    let config: Config = watcher.load().await?;
+    let state = ThreadPoolState {
+        config: ArcSwap::from_pointee(config).into(),
+    };
+    let mut pool = threadpool::ThreadPool::new(state.clone());
 
-    rt.block_on(async move {
-        let watcher = sentinel::file::FileWatcher::new(args.config_file)?;
+    // Closure for restarting all jobs
+    let mut restart = || {
+        pool.ids()
+            .iter()
+            .for_each(|id: &String| pool.stop(id.clone()).expect("failed to stop job"));
+        state.config.load().jobs.iter().for_each(|(name, job)| {
+            pool.spawn(name.clone(), job_handler(job.clone()))
+                .expect("failed to spawn job");
+            tracing::info!("Spawned job {name}: {job:?}");
+        });
+    };
 
-        let config: Config = watcher.load().await?;
-        let state = ThreadPoolState {
-            config: ArcSwap::from_pointee(config).into(),
-        };
+    // Start jobs
+    restart();
 
-        let mut pool = threadpool::ThreadPool::new(state.clone());
-
-        // Closure for restarting all jobs
-        let mut restart = || {
-            pool.ids()
-                .iter()
-                .for_each(|id: &String| pool.stop(id.clone()).expect("failed to stop job"));
-            state.config.load().jobs.iter().for_each(|(name, job)| {
-                pool.spawn(name.clone(), job_handler(job.clone()))
-                    .expect("failed to spawn job");
-                tracing::info!("Spawned job {name}: {job:?}");
-            });
-        };
-
+    // Restart jobs when the config file is changed (hot-reload)
+    while let Some(config) = sentinel::StorageTyped::<Config>::watch(&watcher).await {
+        tracing::info!(
+            "Detected config change, stop {} jobs and start {} jobs",
+            state.config.load().jobs.len(),
+            config.jobs.len()
+        );
+        state.config.store(config.into());
         restart();
-        while let Some(config) = sentinel::StorageTyped::<Config>::watch(&watcher).await {
-            tracing::info!(
-                "Detected config change, stop {} jobs and start {} jobs",
-                state.config.load().jobs.len(),
-                config.jobs.len()
-            );
-            state.config.store(config.into());
-            restart();
-        }
+    }
 
-        Ok::<_, color_eyre::eyre::Error>(())
-    })
+    Ok(())
 }
 
 fn job_handler(
